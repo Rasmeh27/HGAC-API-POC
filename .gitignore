@@ -1,0 +1,12 @@
+@'
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+evidence/snapshots/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.vscode/
+'@ | Set-Content -Encoding UTF8 .gitignore
