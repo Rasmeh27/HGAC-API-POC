@@ -1,12 +1,34 @@
-@'
+# Entornos virtuales
 .venv/
+venv/
+env/
+
+# Bytecode y caches
 __pycache__/
 *.pyc
-.env
-data/
-evidence/snapshots/
+*.pyo
+*.pyd
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# Variables sensibles
+.env
+.env.local
+
+# Datos locales y evidencia
+data/
+evidence/snapshots/
+
+# IDE / editores
 .vscode/
-'@ | Set-Content -Encoding UTF8 .gitignore
+.idea/
+*.swp
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

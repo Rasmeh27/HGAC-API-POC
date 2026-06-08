@@ -5,9 +5,11 @@ pydantic-settings==2.7.1
 python-dotenv==1.0.1
 httpx==0.28.1
 requests==2.32.3
+urllib3==2.3.0
 opencv-python==4.10.0.84
 numpy==2.2.1
 pillow==11.0.0
+easyocr==1.7.2
 sqlalchemy==2.0.36
 alembic==1.14.0
 loguru==0.7.3
