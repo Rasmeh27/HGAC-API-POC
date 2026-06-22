@@ -34,6 +34,7 @@ from app.modules.camera.camera_stream_manager import CameraStreamManager
 from app.modules.camera.snapshot_storage import SnapshotStorage
 from app.modules.crossing.crossing_factory import build_crossing_service
 from app.modules.crossing.crossing_service import CrossingService
+from app.modules.lpr.domain.plate_pattern_catalog import DominicanPlatePatternCatalog
 from app.modules.lpr.lpr_result_storage import LprResultStorage
 from app.modules.lpr.lpr_service import LprService as LprReadService
 from app.modules.lpr.plate_normalizer import PlateNormalizer
@@ -196,6 +197,11 @@ def _cached_lpr_read_service() -> LprReadService:
     formats = build_plate_formats(
         settings.lpr_plate_format_name, settings.lpr_plate_format_regex or None
     )
+    catalog = (
+        DominicanPlatePatternCatalog()
+        if settings.lpr_enable_dominican_plate_catalog
+        else None
+    )
     return LprReadService(
         camera_service=_cached_camera_service(),
         engine=_build_lpr_engine(settings, formats),
@@ -211,6 +217,10 @@ def _cached_lpr_read_service() -> LprReadService:
         ),
         min_confidence=settings.lpr_read_min_confidence,
         max_processing_ms=settings.lpr_max_processing_ms,
+        catalog=catalog,
+        ambiguous_min_score_delta=settings.lpr_ambiguous_min_score_delta,
+        ambiguous_candidate_distance=settings.lpr_ambiguous_candidate_distance,
+        require_multiframe_confirmation=settings.lpr_require_multiframe_confirmation,
     )
 
 

@@ -79,6 +79,17 @@ class Settings(BaseSettings):
     lpr_plate_format_regex: str = ""
     lpr_plate_expected_length: int = 7
 
+    # --- LPR: catálogo de placas dominicanas (referencia operativa DGII) ---
+    # Catálogo operativo para la PoC; NO sustituye validación futura contra
+    # RNTT/Navis/base autorizada y NO autocorrige placas.
+    lpr_enable_dominican_plate_catalog: bool = True
+    # Distancia de caracteres para considerar dos candidatos "casi iguales" (1 = un carácter).
+    lpr_ambiguous_candidate_distance: int = 1
+    # Si la diferencia de score entre dos candidatos válidos es MENOR a esto, es ambiguo.
+    lpr_ambiguous_min_score_delta: float = 15.0
+    # Preparado para exigir confirmación multi-frame (aún no implementado).
+    lpr_require_multiframe_confirmation: bool = False
+
     # --- Cámara ---
     camera_provider: Literal["webcam", "rtsp"] = "webcam"
     webcam_index: int = 0

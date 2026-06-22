@@ -13,6 +13,9 @@ class LprReadStatus(str, Enum):
     NO_PLATE_DETECTED = "NO_PLATE_DETECTED"
     LOW_CONFIDENCE = "LOW_CONFIDENCE"
     FORMAT_MISMATCH = "FORMAT_MISMATCH"
+    # Dos candidatos válidos casi idénticos (difieren en un carácter) con scores
+    # cercanos: no se acepta automáticamente, requiere más evidencia.
+    AMBIGUOUS_READ = "AMBIGUOUS_READ"
     ERROR = "ERROR"
 
 
@@ -56,6 +59,12 @@ class LprReadResponse(BaseModel):
     expected_format: str | None = None
     format_valid: bool = False
     rejection_reason: str | None = None
+
+    # --- Clasificación de placa (catálogo dominicano; null si el catálogo está off
+    #     o si no hubo candidato). No reemplaza validación contra RNTT/Navis. ---
+    plate_type: str | None = None
+    vehicle_type: str | None = None
+    format_pattern: str | None = None
     preprocessing_variant: str | None = None
     crop_saved: bool = False
     selected_roi: str | None = None

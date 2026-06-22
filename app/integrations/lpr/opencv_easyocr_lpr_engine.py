@@ -590,12 +590,16 @@ def _rejection(cand: _Candidate) -> dict:
 
 
 def _score_entry(cand: _Candidate, score: float) -> dict:
+    # Solo hechos OCR; la clasificación DGII la añade el servicio (no el motor).
     return {
-        "text": cand.normalized,
+        "text": cand.raw_text,
+        "normalized_text": cand.normalized,
+        "confidence": round(cand.confidence, 1),
         "score": round(score, 1),
         "roi": cand.roi,
         "variant": cand.variant,
         "digit_count": cand.digit_count,
+        "alpha_count": cand.alpha_count,
     }
 
 

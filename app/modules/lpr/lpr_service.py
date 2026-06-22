@@ -25,10 +25,15 @@ from loguru import logger
 
 from app.integrations.lpr.lpr_engine import LprEngine, LprEngineResult
 from app.modules.camera.camera_service import CameraService
+from app.modules.lpr.domain.plate_ambiguity import detect_ambiguity
+from app.modules.lpr.domain.plate_classification import PlateClassification
+from app.modules.lpr.domain.plate_pattern_catalog import DominicanPlatePatternCatalog
 from app.modules.lpr.lpr_models import LprReadRequest, LprReadResponse, LprReadStatus
 from app.modules.lpr.lpr_result_storage import LprResultStorage, StoredEvidence
 from app.modules.lpr.plate_normalizer import PlateNormalizer
 from app.modules.lpr.plate_validator import PlateValidator
+
+_CATALOG_EXPECTED_FORMAT = "DOMINICAN_PLATE_CATALOG"
 
 
 class LprService:
@@ -41,6 +46,10 @@ class LprService:
         validator: PlateValidator,
         min_confidence: float = 70.0,
         max_processing_ms: int = 5000,
+        catalog: DominicanPlatePatternCatalog | None = None,
+        ambiguous_min_score_delta: float = 15.0,
+        ambiguous_candidate_distance: int = 1,
+        require_multiframe_confirmation: bool = False,
     ) -> None:
         self._camera = camera_service
         self._engine = engine
@@ -49,6 +58,14 @@ class LprService:
         self._validator = validator
         self._min_confidence = min_confidence
         self._max_processing_ms = max_processing_ms
+        # Catálogo dominicano opcional: si es None, el comportamiento es el legacy
+        # (solo PlateValidator por regex). Si se inyecta, manda en format_valid y
+        # aporta clasificación + detección de ambigüedad.
+        self._catalog = catalog
+        self._ambiguous_min_score_delta = ambiguous_min_score_delta
+        self._ambiguous_candidate_distance = ambiguous_candidate_distance
+        # Preparado para exigir confirmación multi-frame; aún no altera la decisión.
+        self._require_multiframe_confirmation = require_multiframe_confirmation
 
     def read_plate(self, request: LprReadRequest) -> LprReadResponse:
         started = time.monotonic()
@@ -108,8 +125,17 @@ class LprService:
         # 5. Hay un candidato. Se guarda el crop usado para OCR (haya o no
         #    formato válido) porque hubo una región/lectura.
         normalized = self._normalizer.normalize(engine_result.best_raw_text)
-        format_valid = self._validator.is_format_valid(normalized)
         confidence = engine_result.confidence
+
+        # Clasificación dominicana (si el catálogo está activo). El catálogo manda
+        # en format_valid; sin catálogo, se mantiene la validación por regex legacy.
+        classification = self._catalog.classify(normalized) if self._catalog else None
+        format_valid = (
+            classification.is_valid
+            if classification is not None
+            else self._validator.is_format_valid(normalized)
+        )
+        enriched_scores = self._enrich_candidate_scores(engine_result.candidate_scores)
 
         stored_crop: StoredEvidence | None = None
         if engine_result.plate_crop_jpeg is not None:
@@ -117,12 +143,9 @@ class LprService:
                 engine_result.plate_crop_jpeg, detected_at
             )
 
-        # 6. Decisión de aceptación: solo PLATE_DETECTED si confianza suficiente
-        #    Y el formato es válido. El candidato rechazado NO se expone como
-        #    `plate` (solo como best_raw_text/best_normalized_text de depuración);
-        #    no se infiere ni autocompleta ningún carácter.
-        #    Precedencia: la confianza se evalúa ANTES que el formato; si ambos
-        #    fallan, el motivo reportado es "low_confidence".
+        # 6. Decisión de aceptación. Precedencia: confianza -> formato -> ambigüedad.
+        #    El candidato rechazado NO se expone como `plate`; no se infiere ni
+        #    autocompleta ningún carácter (p.ej. G237627 NO se "corrige" a G737627).
         if confidence < self._min_confidence:
             status = LprReadStatus.LOW_CONFIDENCE
             rejection_reason: str | None = "low_confidence"
@@ -130,17 +153,33 @@ class LprService:
             status = LprReadStatus.FORMAT_MISMATCH
             rejection_reason = "format_mismatch"
         else:
-            status = LprReadStatus.PLATE_DETECTED
-            rejection_reason = None
+            ambiguity = detect_ambiguity(
+                enriched_scores,
+                min_score_delta=self._ambiguous_min_score_delta,
+                max_distance=self._ambiguous_candidate_distance,
+            )
+            if ambiguity.is_ambiguous:
+                status = LprReadStatus.AMBIGUOUS_READ
+                rejection_reason = ambiguity.reason
+                logger.info(
+                    "LPR {}: lectura ambigua entre {} (delta de score < {})",
+                    event_id,
+                    ambiguity.candidates,
+                    self._ambiguous_min_score_delta,
+                )
+            else:
+                status = LprReadStatus.PLATE_DETECTED
+                rejection_reason = None
 
         accepted = status is LprReadStatus.PLATE_DETECTED
         logger.info(
-            "LPR {}: {} candidato='{}' conf={:.1f} format_valid={} [terminal={} lane={}]",
+            "LPR {}: {} candidato='{}' conf={:.1f} format_valid={} tipo={} [terminal={} lane={}]",
             event_id,
             status.value,
             normalized,
             confidence,
             format_valid,
+            classification.code if classification else "n/a",
             request.terminal,
             request.lane,
         )
@@ -158,7 +197,34 @@ class LprService:
             stored_crop=stored_crop,
             format_valid=format_valid,
             engine_result=engine_result,
+            classification=classification,
+            candidate_scores=enriched_scores,
         )
+
+    def _enrich_candidate_scores(self, scores: tuple[dict, ...]) -> list[dict]:
+        """Añade clasificación DGII a cada candidato del motor (si el catálogo está on).
+
+        El motor entrega solo hechos OCR; aquí (capa de dominio/servicio) se agregan
+        `format_valid`, `plate_type`, `vehicle_type`, `pattern_priority` y
+        `rejection_reason`. Sin catálogo, se devuelven los scores tal cual.
+        """
+        if self._catalog is None:
+            return [dict(score) for score in scores]
+
+        enriched: list[dict] = []
+        for score in scores:
+            normalized = str(score.get("normalized_text") or score.get("text") or "")
+            classification = self._catalog.classify(normalized)
+            entry = dict(score)
+            entry["format_valid"] = classification.is_valid
+            entry["plate_type"] = classification.code
+            entry["vehicle_type"] = classification.vehicle_type
+            entry["pattern_priority"] = classification.priority
+            entry["rejection_reason"] = (
+                None if classification.is_valid else "format_mismatch"
+            )
+            enriched.append(entry)
+        return enriched
 
     def _respond(
         self,
@@ -176,6 +242,8 @@ class LprService:
         stored_crop: StoredEvidence | None = None,
         format_valid: bool = False,
         engine_result: LprEngineResult | None = None,
+        classification: PlateClassification | None = None,
+        candidate_scores: list[dict] | None = None,
     ) -> LprReadResponse:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if elapsed_ms > self._max_processing_ms:
@@ -205,9 +273,16 @@ class LprService:
             best_normalized_text=(
                 engine_result.best_normalized_text if engine_result else None
             ),
-            expected_format=self._validator.expected_format,
+            expected_format=(
+                _CATALOG_EXPECTED_FORMAT if self._catalog else self._validator.expected_format
+            ),
             format_valid=format_valid,
             rejection_reason=rejection_reason,
+            plate_type=classification.code if classification else None,
+            vehicle_type=classification.vehicle_type if classification else None,
+            format_pattern=(
+                classification.pattern if classification and classification.pattern else None
+            ),
             preprocessing_variant=(
                 engine_result.preprocessing_variant if engine_result else None
             ),
@@ -219,7 +294,9 @@ class LprService:
                 list(engine_result.candidate_rejections) if engine_result else []
             ),
             candidate_scores=(
-                list(engine_result.candidate_scores) if engine_result else []
+                candidate_scores
+                if candidate_scores is not None
+                else (list(engine_result.candidate_scores) if engine_result else [])
             ),
         )
 

@@ -196,7 +196,8 @@ Diferencia Camera vs. LPR:
   placa, solo si hay detección). **Nunca** escribe en `evidence/snapshots/`.
 
 Estados de respuesta: `PLATE_DETECTED`, `LOW_CONFIDENCE`, `FORMAT_MISMATCH`,
-`NO_PLATE_DETECTED`, `ERROR`. Cámara inexistente → 404; cámara sin frame → 503.
+`AMBIGUOUS_READ`, `NO_PLATE_DETECTED`, `ERROR`. Cámara inexistente → 404; cámara
+sin frame → 503.
 
 **Aceptación estricta:** una lectura es `PLATE_DETECTED` solo si la confianza
 supera `LPR_READ_MIN_CONFIDENCE` **y** la placa normalizada cumple alguno de los
@@ -212,6 +213,35 @@ CSV de nombres; por defecto se aceptan ambos):
 |---|---|---|
 | `LETTER_6_DIGITS` | `^[A-Z][0-9]{6}$` | `L460432` |
 | `TWO_LETTERS_5_DIGITS` | `^[A-Z]{2}[0-9]{5}$` | `OF00105` |
+
+**Catálogo de placas dominicanas (DGII).** Con
+`LPR_ENABLE_DOMINICAN_PLATE_CATALOG=true` (por defecto), la validación de formato
+y la clasificación pasan a `app/modules/lpr/domain/` (no a regex sueltas en el
+servicio ni al motor OCR). El catálogo es **referencia operativa para la PoC, no
+fuente legal**: no autocorrige placas ni reemplaza la validación futura contra
+RNTT/Navis/base autorizada. La respuesta añade `plate_type`, `vehicle_type` y
+`format_pattern`, y cada entrada de `candidate_scores` se enriquece con
+`format_valid`, `plate_type`, `vehicle_type`, `pattern_priority` y
+`rejection_reason`. Patrones soportados:
+
+| Patrón | Tipo | Patrón | Tipo |
+|---|---|---|---|
+| `A` + 6 díg. | Automóvil privado | `J` + 6 díg. | Montacargas |
+| `G` + 6 díg. | Jeepeta | `PP` + 6 díg. | Provisional electrónica |
+| `L` + 6 díg. | Carga | `EX` + 5 díg. | Exonerada |
+| `F` + 6 díg. | Remolque | `DD` + 5 díg. | Dealer |
+| `U` + 6 díg. | Máquina pesada | `OF/OP/OE/OM` + 5 díg. | Oficial |
+| letra + 7 díg. | Motocicleta | | |
+
+**Lecturas ambiguas (`AMBIGUOUS_READ`).** Si dos candidatos válidos comparten
+prefijo y longitud, difieren en un solo carácter
+(`LPR_AMBIGUOUS_CANDIDATE_DISTANCE`) y sus scores están más cerca que
+`LPR_AMBIGUOUS_MIN_SCORE_DELTA`, la lectura **no se acepta automáticamente**
+(`rejection_reason="ambiguous_digit_conflict"`, `plate=null`). Un caso como
+`G237627` vs `G737627` debe resolverse por consenso multi-frame, más intentos
+OCR, un score significativamente superior o match contra base autorizada —
+**nunca** sustituyendo un carácter a mano. `LPR_REQUIRE_MULTIFRAME_CONFIRMATION`
+queda preparado para exigir confirmación multi-frame (aún no altera la decisión).
 
 **Motor (prioriza el serial, descarta el encabezado):** tras recortar la placa
 (con padding) el OCR se enfoca en sub-ROIs del **serial** (zona inferior/central),
