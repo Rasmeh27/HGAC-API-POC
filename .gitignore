@@ -15,9 +15,11 @@ __pycache__/
 # Variables sensibles
 .env
 .env.local
+config/cameras.json
 
 # Datos locales y evidencia
 data/
+evidence/
 evidence/snapshots/*.jpg
 evidence/lpr/frames/*.jpg
 evidence/lpr/crops/*.jpg
