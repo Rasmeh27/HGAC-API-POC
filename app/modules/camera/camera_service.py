@@ -7,6 +7,7 @@ depender de `LprService`. Así el módulo de cámara no arrastra OCR/LPR.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Callable
@@ -15,8 +16,8 @@ import cv2
 import numpy as np
 from loguru import logger
 
-from app.core.errors import CameraError
-from app.integrations.camera.camera_provider import CameraProvider
+from app.core.errors import CameraError, CameraTimeoutError
+from app.integrations.camera.camera_provider import CameraProvider, StreamOptions
 from app.integrations.camera.rtsp_camera_provider import RtspCameraProvider
 from app.integrations.camera.webcam_camera_provider import WebcamCameraProvider
 from app.modules.camera.camera_models import (
@@ -58,6 +59,9 @@ class CameraService:
     def ensure_camera_exists(self, camera_id: str) -> None:
         """Valida que el `camera_id` exista. Lanza `CameraNotFoundError` si no."""
         self._registry.get(camera_id)
+
+    def get_config(self, camera_id: str) -> CameraConfig:
+        return self._registry.get(camera_id)
 
     def get_status(self, camera_id: str) -> CameraStatusResponse:
         """Reporta el estado de la cámara.
@@ -110,6 +114,33 @@ class CameraService:
         """
         config = self._registry.get(camera_id)
         return self._grab_frame(config)
+
+    def capture_frame_burst(
+        self, camera_id: str, count: int = 5, interval_ms: int = 150
+    ) -> list[bytes]:
+        """Captura varios frames desde una sola sesión de cámara.
+
+        La ráfaga se captura completa antes de iniciar OCR para que el tiempo de
+        procesamiento no altere el intervalo visual entre imágenes.
+        """
+        config = self._registry.get(camera_id)
+        count = max(1, min(count, 10))
+        interval_seconds = max(0, interval_ms) / 1000.0
+        provider = self._provider_factory(config)
+        session = provider.open_session(StreamOptions(jpeg_quality=90))
+        frames: list[bytes] = []
+        try:
+            for index in range(count):
+                frame = session.read_jpeg()
+                if frame:
+                    frames.append(frame)
+                if index + 1 < count and interval_seconds:
+                    time.sleep(interval_seconds)
+        finally:
+            session.release()
+        if not frames:
+            raise CameraTimeoutError("La cámara no devolvió frames para la ráfaga")
+        return frames
 
     def open_mjpeg_stream(self, camera_id: str) -> Iterator[bytes]:
         """Devuelve un iterador de chunks MJPEG (`multipart/x-mixed-replace`).

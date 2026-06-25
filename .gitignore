@@ -15,14 +15,11 @@ __pycache__/
 # Variables sensibles
 .env
 .env.local
+config/cameras.json
 
 # Datos locales y evidencia
 data/
 evidence/
-
-# Configuración local con datos sensibles (URLs RTSP reales, etc.).
-# Versionar solo el ejemplo: config/cameras.example.json
-config/cameras.json
 
 # IDE / editores
 .vscode/
