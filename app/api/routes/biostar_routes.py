@@ -10,9 +10,9 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.api.dependencies import biostar_service_provider, settings_provider
+from app.api.dependencies import biostar_service_provider
 from app.api.schemas import BioStarVerifyRequest, BioStarVerifyResponse
-from app.core.config import Settings
+from app.core.config import get_settings
 from app.core.errors import BioStarAuthenticationError, BioStarError
 from app.integrations.biostar.biostar_service import BioStarService
 
@@ -20,9 +20,7 @@ router = APIRouter(prefix="/biostar", tags=["BioStar"])
 
 
 @router.get("/events/latest")
-def latest_local_event(
-    settings: Settings = Depends(settings_provider),
-) -> dict:
+def latest_local_event() -> dict:
     """Devuelve el último evento publicado por el monitor BioStar local.
 
     El monitor (`scripts/monitor_biostar_local.py`) escribe el snapshot JSON en
@@ -31,6 +29,7 @@ def latest_local_event(
     con un mensaje claro para que el consumidor (Ignition) sepa que el monitor
     aún no tiene datos.
     """
+      settings = get_settings()
     path = Path(settings.biostar_local_output_path)
 
     if not path.exists():
