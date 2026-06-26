@@ -13,9 +13,6 @@ class LprReadStatus(str, Enum):
     NO_PLATE_DETECTED = "NO_PLATE_DETECTED"
     LOW_CONFIDENCE = "LOW_CONFIDENCE"
     FORMAT_MISMATCH = "FORMAT_MISMATCH"
-    # Dos candidatos válidos casi idénticos (difieren en un carácter) con scores
-    # cercanos: no se acepta automáticamente, requiere más evidencia.
-    AMBIGUOUS_READ = "AMBIGUOUS_READ"
     ERROR = "ERROR"
 
 
@@ -39,10 +36,8 @@ class LprReadRequest(BaseModel):
 class LprReadResponse(BaseModel):
     event_id: str
     camera_id: str
-    # Identidad de la cámara (para el contrato de Ignition). Opcionales: en una
-    # lectura puntual pueden no resolverse, pero forman parte del contrato.
-    camera_name: str | None = None
-    camera_ip: str | None = None
+    camera_name: str = ""
+    camera_ip: str = ""
     status: LprReadStatus
     plate: str | None = None
     plate_normalized: str | None = None
@@ -63,21 +58,18 @@ class LprReadResponse(BaseModel):
     expected_format: str | None = None
     format_valid: bool = False
     rejection_reason: str | None = None
-
-    # --- Clasificación de placa (catálogo dominicano; null si el catálogo está off
-    #     o si no hubo candidato). No reemplaza validación contra RNTT/Navis. ---
-    plate_type: str | None = None
-    vehicle_type: str | None = None
-    format_pattern: str | None = None
+    
     preprocessing_variant: str | None = None
     crop_saved: bool = False
     selected_roi: str | None = None
     digit_count: int = 0
     alpha_count: int = 0
-    # Consenso temporal sobre ráfaga de frames. En la lectura de un solo frame
-    # (v1) quedan en 0; reservados para la confirmación multi-frame.
+    candidate_rejections: list[dict] = Field(default_factory=list)
+    candidate_scores: list[dict] = Field(default_factory=list)
+    frames_requested: int = 1
+    frames_captured: int = 1
+    frames_processed: int = 1
     consensus_votes: int = 0
     consensus_total: int = 0
     consensus_ratio: float = 0.0
-    candidate_rejections: list[dict] = Field(default_factory=list)
-    candidate_scores: list[dict] = Field(default_factory=list)
+    frame_candidates: list[dict] = Field(default_factory=list)
