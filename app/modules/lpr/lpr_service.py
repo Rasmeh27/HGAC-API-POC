@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -26,15 +28,19 @@ from loguru import logger
 
 from app.integrations.lpr.lpr_engine import LprEngine, LprEngineResult
 from app.modules.camera.camera_service import CameraService
-from app.modules.lpr.domain.plate_ambiguity import detect_ambiguity
-from app.modules.lpr.domain.plate_classification import PlateClassification
-from app.modules.lpr.domain.plate_pattern_catalog import DominicanPlatePatternCatalog
 from app.modules.lpr.lpr_models import LprReadRequest, LprReadResponse, LprReadStatus
 from app.modules.lpr.lpr_result_storage import LprResultStorage, StoredEvidence
 from app.modules.lpr.plate_normalizer import PlateNormalizer
 from app.modules.lpr.plate_validator import PlateValidator
 
-_CATALOG_EXPECTED_FORMAT = "DOMINICAN_PLATE_CATALOG"
+
+@dataclass(frozen=True)
+class _FrameObservation:
+    index: int
+    frame_bytes: bytes
+    engine_result: LprEngineResult
+    normalized: str
+    format_valid: bool
 
 
 class LprService:
@@ -47,11 +53,11 @@ class LprService:
         validator: PlateValidator,
         min_confidence: float = 70.0,
         max_processing_ms: int = 5000,
-        catalog: DominicanPlatePatternCatalog | None = None,
-        ambiguous_min_score_delta: float = 15.0,
-        ambiguous_candidate_distance: int = 1,
-        require_multiframe_confirmation: bool = False,
-        result_observer: Callable[[LprReadResponse], None] | None = None,
+        burst_frame_count: int = 1,
+        burst_interval_ms: int = 200,
+        consensus_min_votes: int = 2,
+        early_consensus: bool = True,
+        result_sink: Callable[[LprReadResponse], object] | None = None,
     ) -> None:
         self._camera = camera_service
         self._engine = engine
@@ -60,20 +66,227 @@ class LprService:
         self._validator = validator
         self._min_confidence = min_confidence
         self._max_processing_ms = max_processing_ms
-        # Observador opcional invocado con CADA lectura (aceptada o rechazada). Se
-        # usa para publicar el "latest" en Ignition sin acoplar el servicio al
-        # escritor concreto. Sus fallos NUNCA deben romper la respuesta LPR.
-        self._result_observer = result_observer
-        # Catálogo dominicano opcional: si es None, el comportamiento es el legacy
-        # (solo PlateValidator por regex). Si se inyecta, manda en format_valid y
-        # aporta clasificación + detección de ambigüedad.
-        self._catalog = catalog
-        self._ambiguous_min_score_delta = ambiguous_min_score_delta
-        self._ambiguous_candidate_distance = ambiguous_candidate_distance
-        # Preparado para exigir confirmación multi-frame; aún no altera la decisión.
-        self._require_multiframe_confirmation = require_multiframe_confirmation
+        self._burst_frame_count = max(1, burst_frame_count)
+        self._burst_interval_ms = max(0, burst_interval_ms)
+        self._consensus_min_votes = max(1, consensus_min_votes)
+        self._early_consensus = early_consensus
+        self._result_sink = result_sink
 
     def read_plate(self, request: LprReadRequest) -> LprReadResponse:
+        started = time.monotonic()
+        detected_at = datetime.now(timezone.utc)
+        event_id = request.event_id or f"LPR-{detected_at.strftime('%Y%m%d-%H%M%S')}"
+
+        if self._burst_frame_count == 1:
+            frames = [self._camera.capture_current_frame(request.camera_id)]
+        else:
+            frames = self._camera.capture_frame_burst(
+                request.camera_id,
+                count=self._burst_frame_count,
+                interval_ms=self._burst_interval_ms,
+            )
+
+        config = self._camera.get_config(request.camera_id)
+        observations: list[_FrameObservation] = []
+        for index, frame_bytes in enumerate(frames):
+            image = _decode_jpeg(frame_bytes)
+            if image is None:
+                continue
+            if config.has_lpr_roi:
+                height, width = image.shape[:2]
+                x1 = max(0, min(config.roi_x, width))
+                y1 = max(0, min(config.roi_y, height))
+                x2 = max(x1, min(x1 + config.roi_width, width))
+                y2 = max(y1, min(y1 + config.roi_height, height))
+                cropped = image[y1:y2, x1:x2]
+                if cropped.size:
+                    image = cropped
+            try:
+                result = self._engine.read_plate(image)
+            except Exception:  # noqa: BLE001
+                logger.exception("LPR {}: fallo OCR en frame {}", event_id, index)
+                continue
+            normalized = (
+                result.best_normalized_text
+                or self._normalizer.normalize(result.best_raw_text)
+            )
+            observations.append(
+                _FrameObservation(
+                    index=index,
+                    frame_bytes=frame_bytes,
+                    engine_result=result,
+                    normalized=normalized,
+                    format_valid=self._validator.is_format_valid(normalized),
+                )
+            )
+            if self._early_consensus and self._burst_frame_count > 1:
+                matching = [
+                    obs
+                    for obs in observations
+                    if obs.normalized == normalized and obs.format_valid
+                ]
+                average_confidence = (
+                    sum(obs.engine_result.confidence for obs in matching)
+                    / len(matching)
+                    if matching
+                    else 0.0
+                )
+                if (
+                    len(matching) >= self._consensus_min_votes
+                    and average_confidence >= self._min_confidence
+                ):
+                    logger.info(
+                        "LPR {}: consenso temprano '{}' alcanzado en {}/{} frames",
+                        event_id,
+                        normalized,
+                        len(observations),
+                        len(frames),
+                    )
+                    break
+
+        if not observations:
+            stored = self._storage.save_frame(frames[0], detected_at)
+            return self._respond(
+                event_id=event_id,
+                request=request,
+                started=started,
+                detected_at=detected_at,
+                stored_frame=stored,
+                status=LprReadStatus.ERROR,
+                rejection_reason="no_processable_frames",
+                frames_requested=self._burst_frame_count,
+                frames_captured=len(frames),
+                frames_processed=0,
+            )
+
+        valid_groups: dict[str, list[_FrameObservation]] = {}
+        for observation in observations:
+            if observation.normalized and observation.format_valid:
+                valid_groups.setdefault(observation.normalized, []).append(observation)
+
+        if valid_groups:
+            winning_text, winning_group = max(
+                valid_groups.items(),
+                key=lambda item: (
+                    len(item[1]),
+                    sum(obs.engine_result.confidence for obs in item[1]) / len(item[1]),
+                    max(obs.engine_result.confidence for obs in item[1]),
+                ),
+            )
+            winner = max(
+                winning_group, key=lambda obs: obs.engine_result.confidence
+            )
+        else:
+            winner = max(
+                observations, key=lambda obs: obs.engine_result.confidence
+            )
+            winning_text = winner.normalized
+            winning_group = [
+                obs for obs in observations if obs.normalized == winning_text
+            ]
+
+        votes = len(winning_group) if winning_text else 0
+        consensus_total = len(observations)
+        consensus_ratio = votes / consensus_total if consensus_total else 0.0
+        confidence = (
+            sum(obs.engine_result.confidence for obs in winning_group) / votes
+            if votes
+            else 0.0
+        )
+        engine_result = replace(
+            winner.engine_result,
+            candidate_count=sum(
+                obs.engine_result.candidate_count for obs in observations
+            ),
+            ocr_attempt_count=sum(
+                obs.engine_result.ocr_attempt_count for obs in observations
+            ),
+        )
+        stored_frame = self._storage.save_frame(winner.frame_bytes, detected_at)
+        frame_candidates = [
+            {
+                "frame_index": obs.index,
+                "text": obs.normalized or None,
+                "raw_text": obs.engine_result.best_raw_text,
+                "confidence": obs.engine_result.confidence,
+                "format_valid": obs.format_valid,
+            }
+            for obs in observations
+        ]
+
+        if engine_result.best_raw_text is None:
+            return self._respond(
+                event_id=event_id,
+                request=request,
+                started=started,
+                detected_at=detected_at,
+                stored_frame=stored_frame,
+                status=LprReadStatus.NO_PLATE_DETECTED,
+                rejection_reason="no_text",
+                engine_result=engine_result,
+                frames_requested=self._burst_frame_count,
+                frames_captured=len(frames),
+                frames_processed=len(observations),
+                consensus_votes=votes,
+                consensus_total=consensus_total,
+                consensus_ratio=consensus_ratio,
+                frame_candidates=frame_candidates,
+            )
+
+        stored_crop: StoredEvidence | None = None
+        if engine_result.plate_crop_jpeg is not None:
+            stored_crop = self._storage.save_crop(
+                engine_result.plate_crop_jpeg, detected_at
+            )
+
+        format_valid = self._validator.is_format_valid(winning_text)
+        if self._burst_frame_count > 1 and votes < self._consensus_min_votes:
+            status = LprReadStatus.LOW_CONFIDENCE
+            rejection_reason: str | None = "insufficient_consensus"
+        elif confidence < self._min_confidence:
+            status = LprReadStatus.LOW_CONFIDENCE
+            rejection_reason = "low_confidence"
+        elif not format_valid:
+            status = LprReadStatus.FORMAT_MISMATCH
+            rejection_reason = "format_mismatch"
+        else:
+            status = LprReadStatus.PLATE_DETECTED
+            rejection_reason = None
+
+        accepted = status is LprReadStatus.PLATE_DETECTED
+        logger.info(
+            "LPR {}: {} candidato='{}' votos={}/{} conf={:.1f}",
+            event_id,
+            status.value,
+            winning_text,
+            votes,
+            consensus_total,
+            confidence,
+        )
+        return self._respond(
+            event_id=event_id,
+            request=request,
+            started=started,
+            detected_at=detected_at,
+            stored_frame=stored_frame,
+            status=status,
+            rejection_reason=rejection_reason,
+            plate=winner.engine_result.best_raw_text if accepted else None,
+            plate_normalized=winning_text if accepted else None,
+            confidence=round(confidence, 1),
+            stored_crop=stored_crop,
+            format_valid=format_valid,
+            engine_result=engine_result,
+            frames_requested=self._burst_frame_count,
+            frames_captured=len(frames),
+            frames_processed=len(observations),
+            consensus_votes=votes,
+            consensus_total=consensus_total,
+            consensus_ratio=consensus_ratio,
+            frame_candidates=frame_candidates,
+        )
+
+    def _read_plate_single_legacy(self, request: LprReadRequest) -> LprReadResponse:
         started = time.monotonic()
         detected_at = datetime.now(timezone.utc)
         event_id = request.event_id or f"LPR-{detected_at.strftime('%Y%m%d-%H%M%S')}"
@@ -97,6 +310,26 @@ class LprService:
                 status=LprReadStatus.ERROR,
                 rejection_reason="decode_error",
             )
+
+        camera_config = self._camera.get_config(request.camera_id)
+        if camera_config.has_lpr_roi:
+            height, width = image.shape[:2]
+            x1 = max(0, min(camera_config.roi_x, width))
+            y1 = max(0, min(camera_config.roi_y, height))
+            x2 = max(x1, min(x1 + camera_config.roi_width, width))
+            y2 = max(y1, min(y1 + camera_config.roi_height, height))
+            cropped = image[y1:y2, x1:x2]
+            if cropped.size:
+                image = cropped
+                logger.info(
+                    "LPR {}: ROI de camara {} aplicado ({},{}) {}x{}",
+                    event_id,
+                    request.camera_id,
+                    x1,
+                    y1,
+                    x2 - x1,
+                    y2 - y1,
+                )
 
         # 3. Motor LPR. Un fallo del motor (p.ej. EasyOCR ausente) no debe tumbar
         #    el endpoint: se devuelve estado ERROR con el frame ya guardado.
@@ -130,18 +363,12 @@ class LprService:
 
         # 5. Hay un candidato. Se guarda el crop usado para OCR (haya o no
         #    formato válido) porque hubo una región/lectura.
-        normalized = self._normalizer.normalize(engine_result.best_raw_text)
-        confidence = engine_result.confidence
-
-        # Clasificación dominicana (si el catálogo está activo). El catálogo manda
-        # en format_valid; sin catálogo, se mantiene la validación por regex legacy.
-        classification = self._catalog.classify(normalized) if self._catalog else None
-        format_valid = (
-            classification.is_valid
-            if classification is not None
-            else self._validator.is_format_valid(normalized)
+        normalized = (
+            engine_result.best_normalized_text
+            or self._normalizer.normalize(engine_result.best_raw_text)
         )
-        enriched_scores = self._enrich_candidate_scores(engine_result.candidate_scores)
+        format_valid = self._validator.is_format_valid(normalized)
+        confidence = engine_result.confidence
 
         stored_crop: StoredEvidence | None = None
         if engine_result.plate_crop_jpeg is not None:
@@ -149,9 +376,12 @@ class LprService:
                 engine_result.plate_crop_jpeg, detected_at
             )
 
-        # 6. Decisión de aceptación. Precedencia: confianza -> formato -> ambigüedad.
-        #    El candidato rechazado NO se expone como `plate`; no se infiere ni
-        #    autocompleta ningún carácter (p.ej. G237627 NO se "corrige" a G737627).
+        # 6. Decisión de aceptación: solo PLATE_DETECTED si confianza suficiente
+        #    Y el formato es válido. El candidato rechazado NO se expone como
+        #    `plate` (solo como best_raw_text/best_normalized_text de depuración);
+        #    no se infiere ni autocompleta ningún carácter.
+        #    Precedencia: la confianza se evalúa ANTES que el formato; si ambos
+        #    fallan, el motivo reportado es "low_confidence".
         if confidence < self._min_confidence:
             status = LprReadStatus.LOW_CONFIDENCE
             rejection_reason: str | None = "low_confidence"
@@ -159,33 +389,17 @@ class LprService:
             status = LprReadStatus.FORMAT_MISMATCH
             rejection_reason = "format_mismatch"
         else:
-            ambiguity = detect_ambiguity(
-                enriched_scores,
-                min_score_delta=self._ambiguous_min_score_delta,
-                max_distance=self._ambiguous_candidate_distance,
-            )
-            if ambiguity.is_ambiguous:
-                status = LprReadStatus.AMBIGUOUS_READ
-                rejection_reason = ambiguity.reason
-                logger.info(
-                    "LPR {}: lectura ambigua entre {} (delta de score < {})",
-                    event_id,
-                    ambiguity.candidates,
-                    self._ambiguous_min_score_delta,
-                )
-            else:
-                status = LprReadStatus.PLATE_DETECTED
-                rejection_reason = None
+            status = LprReadStatus.PLATE_DETECTED
+            rejection_reason = None
 
         accepted = status is LprReadStatus.PLATE_DETECTED
         logger.info(
-            "LPR {}: {} candidato='{}' conf={:.1f} format_valid={} tipo={} [terminal={} lane={}]",
+            "LPR {}: {} candidato='{}' conf={:.1f} format_valid={} [terminal={} lane={}]",
             event_id,
             status.value,
             normalized,
             confidence,
             format_valid,
-            classification.code if classification else "n/a",
             request.terminal,
             request.lane,
         )
@@ -203,34 +417,7 @@ class LprService:
             stored_crop=stored_crop,
             format_valid=format_valid,
             engine_result=engine_result,
-            classification=classification,
-            candidate_scores=enriched_scores,
         )
-
-    def _enrich_candidate_scores(self, scores: tuple[dict, ...]) -> list[dict]:
-        """Añade clasificación DGII a cada candidato del motor (si el catálogo está on).
-
-        El motor entrega solo hechos OCR; aquí (capa de dominio/servicio) se agregan
-        `format_valid`, `plate_type`, `vehicle_type`, `pattern_priority` y
-        `rejection_reason`. Sin catálogo, se devuelven los scores tal cual.
-        """
-        if self._catalog is None:
-            return [dict(score) for score in scores]
-
-        enriched: list[dict] = []
-        for score in scores:
-            normalized = str(score.get("normalized_text") or score.get("text") or "")
-            classification = self._catalog.classify(normalized)
-            entry = dict(score)
-            entry["format_valid"] = classification.is_valid
-            entry["plate_type"] = classification.code
-            entry["vehicle_type"] = classification.vehicle_type
-            entry["pattern_priority"] = classification.priority
-            entry["rejection_reason"] = (
-                None if classification.is_valid else "format_mismatch"
-            )
-            enriched.append(entry)
-        return enriched
 
     def _respond(
         self,
@@ -248,8 +435,13 @@ class LprService:
         stored_crop: StoredEvidence | None = None,
         format_valid: bool = False,
         engine_result: LprEngineResult | None = None,
-        classification: PlateClassification | None = None,
-        candidate_scores: list[dict] | None = None,
+        frames_requested: int = 1,
+        frames_captured: int = 1,
+        frames_processed: int = 1,
+        consensus_votes: int = 0,
+        consensus_total: int = 0,
+        consensus_ratio: float = 0.0,
+        frame_candidates: list[dict] | None = None,
     ) -> LprReadResponse:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if elapsed_ms > self._max_processing_ms:
@@ -259,9 +451,16 @@ class LprService:
                 elapsed_ms,
                 self._max_processing_ms,
             )
+        camera_config = self._camera.get_config(request.camera_id)
+        camera_ip = ""
+        if camera_config.source_type == "rtsp":
+            camera_ip = urlsplit(camera_config.source).hostname or ""
+
         response = LprReadResponse(
             event_id=event_id,
             camera_id=request.camera_id,
+            camera_name=camera_config.camera_name,
+            camera_ip=camera_ip,
             status=status,
             plate=plate,
             plate_normalized=plate_normalized,
@@ -279,16 +478,9 @@ class LprService:
             best_normalized_text=(
                 engine_result.best_normalized_text if engine_result else None
             ),
-            expected_format=(
-                _CATALOG_EXPECTED_FORMAT if self._catalog else self._validator.expected_format
-            ),
+            expected_format=self._validator.expected_format,
             format_valid=format_valid,
             rejection_reason=rejection_reason,
-            plate_type=classification.code if classification else None,
-            vehicle_type=classification.vehicle_type if classification else None,
-            format_pattern=(
-                classification.pattern if classification and classification.pattern else None
-            ),
             preprocessing_variant=(
                 engine_result.preprocessing_variant if engine_result else None
             ),
@@ -300,29 +492,22 @@ class LprService:
                 list(engine_result.candidate_rejections) if engine_result else []
             ),
             candidate_scores=(
-                candidate_scores
-                if candidate_scores is not None
-                else (list(engine_result.candidate_scores) if engine_result else [])
+                list(engine_result.candidate_scores) if engine_result else []
             ),
+            frames_requested=frames_requested,
+            frames_captured=frames_captured,
+            frames_processed=frames_processed,
+            consensus_votes=consensus_votes,
+            consensus_total=consensus_total,
+            consensus_ratio=round(consensus_ratio, 3),
+            frame_candidates=frame_candidates or [],
         )
-        self._notify_observer(response)
+        if self._result_sink is not None:
+            try:
+                self._result_sink(response)
+            except Exception:  # noqa: BLE001 - Ignition no debe tumbar la lectura LPR
+                logger.exception("LPR {}: no se pudo publicar el resultado a Ignition", event_id)
         return response
-
-    def _notify_observer(self, response: LprReadResponse) -> None:
-        """Publica la lectura al observador (p.ej. Ignition latest), si hay uno.
-
-        Aísla cualquier fallo (archivo bloqueado por Ignition, disco lleno, etc.)
-        para que la respuesta LPR se devuelva siempre.
-        """
-        if self._result_observer is None:
-            return
-        try:
-            self._result_observer(response)
-        except Exception:  # noqa: BLE001 - publicar el latest no debe romper la lectura
-            logger.exception(
-                "LPR {}: no se pudo publicar la lectura al observador",
-                response.event_id,
-            )
 
 
 def _decode_jpeg(frame_bytes: bytes) -> np.ndarray | None:
