@@ -27,6 +27,7 @@ Variables (todas opcionales):
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -57,6 +58,30 @@ def _enabled(name: str, default: bool = True) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "si", "on"}
 
 
+def _app_python() -> str:
+    """Elige un Python que realmente tenga las dependencias del backend."""
+    candidates = [VENV_PYTHON, Path(sys.executable)]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        check = subprocess.run(
+            [
+                str(candidate),
+                "-c",
+                "import fastapi, uvicorn, dotenv",
+            ],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if check.returncode == 0:
+            return str(candidate)
+    raise RuntimeError(
+        "No se encontro un Python funcional. Instale requirements.txt en .venv."
+    )
+
+
 def _biostar_command(app_python: str) -> list[str]:
     """Comando del monitor BioStar local, con credenciales tomadas del entorno.
 
@@ -84,9 +109,11 @@ def _biostar_command(app_python: str) -> list[str]:
 
 
 def _specs() -> list[ProcessSpec]:
-    app_python = str(VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable))
+    app_python = _app_python()
     simplelpr_python = os.getenv("SIMPLELPR_PYTHON", app_python)
     has_biostar_password = bool(os.getenv("BIOSTAR_LOCAL_PASSWORD", "").strip())
+    backend_host = os.getenv("HGAC_BACKEND_HOST", "127.0.0.1")
+    backend_port = os.getenv("HGAC_BACKEND_PORT", "8000")
     return [
         ProcessSpec(
             "backend",
@@ -96,9 +123,9 @@ def _specs() -> list[ProcessSpec]:
                 "uvicorn",
                 "app.main:app",
                 "--host",
-                "127.0.0.1",
+                backend_host,
                 "--port",
-                "8000",
+                backend_port,
             ],
             _enabled("HGAC_START_BACKEND", True),
         ),
@@ -118,6 +145,12 @@ def _specs() -> list[ProcessSpec]:
     ]
 
 
+def _is_port_open(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.25)
+        return sock.connect_ex((host, port)) == 0
+
+
 def main() -> int:
     os.chdir(ROOT)
     load_dotenv(ROOT / ".env")
@@ -129,6 +162,16 @@ def main() -> int:
     restart_delay = max(3.0, float(os.getenv("HGAC_RESTART_DELAY_SECONDS", "15")))
 
     def start(spec: ProcessSpec) -> None:
+        if spec.name == "backend":
+            backend_host = os.getenv("HGAC_BACKEND_HOST", "127.0.0.1")
+            backend_port = int(os.getenv("HGAC_BACKEND_PORT", "8000"))
+            if _is_port_open(backend_host, backend_port):
+                print(
+                    f"[Supervisor] backend NO iniciado: "
+                    f"{backend_host}:{backend_port} ya esta ocupado. "
+                    "Cierre el proceso que usa ese puerto o cambie HGAC_BACKEND_PORT."
+                )
+                return
         print(f"[Supervisor] Iniciando {spec.name}...")
         children[spec.name] = (spec, subprocess.Popen(spec.command, cwd=ROOT))
 

@@ -54,5 +54,11 @@ class RtspCameraProvider(CameraProvider):
             raise CameraNotAvailableError(
                 "No se pudo conectar al stream RTSP para streaming"
             )
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         logger.info("RTSP stream abierto para streaming")
-        return OpenCvCaptureSession(capture, jpeg_quality=options.jpeg_quality)
+        return OpenCvCaptureSession(
+            capture,
+            jpeg_quality=options.jpeg_quality,
+            max_width=options.width,
+            max_height=options.height,
+        )

@@ -251,14 +251,10 @@ def _cached_lpr_read_service() -> LprReadService:
         validator=validator,
         min_confidence=settings.lpr_read_min_confidence,
         max_processing_ms=settings.lpr_max_processing_ms,
-        catalog=catalog,
-        ambiguous_min_score_delta=settings.lpr_ambiguous_min_score_delta,
-        ambiguous_candidate_distance=settings.lpr_ambiguous_candidate_distance,
-        require_multiframe_confirmation=settings.lpr_require_multiframe_confirmation,
         # Publica cada lectura del endpoint formal en el "latest" de Ignition
         # (escritura atómica). Si el archivo está bloqueado, el observador lo
         # registra sin romper la respuesta HTTP.
-        result_observer=_cached_ignition_writer().write_lpr_latest,
+        result_sink=_cached_ignition_writer().write_lpr_latest,
     )
 
 

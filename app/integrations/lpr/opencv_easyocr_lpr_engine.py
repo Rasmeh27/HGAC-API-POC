@@ -146,6 +146,8 @@ class OpenCvEasyOcrLprEngine(LprEngine):
         upscale: int = 3,
         pad_x_ratio: float = 0.20,
         pad_y_ratio: float = 0.12,
+        pad_left_ratio: float | None = None,
+        pad_right_ratio: float | None = None,
         mode: str = _DEFAULT_MODE,
         min_serial_digits: int = 3,
         early_stop_confidence: float = 70.0,
@@ -159,7 +161,12 @@ class OpenCvEasyOcrLprEngine(LprEngine):
         self._formats = [re.compile(rx) for rx in expected_formats]
         self._expected_length = expected_length
         self._upscale = upscale
-        self._pad_x_ratio = pad_x_ratio
+        self._pad_left_ratio = (
+            pad_x_ratio if pad_left_ratio is None else pad_left_ratio
+        )
+        self._pad_right_ratio = (
+            pad_x_ratio if pad_right_ratio is None else pad_right_ratio
+        )
         self._pad_y_ratio = pad_y_ratio
         self._profile = _MODE_PROFILES.get(mode, _MODE_PROFILES[_DEFAULT_MODE])
         self._min_serial_digits = min_serial_digits
@@ -194,8 +201,9 @@ class OpenCvEasyOcrLprEngine(LprEngine):
                 region.y,
                 region.width,
                 region.height,
-                self._pad_x_ratio,
-                self._pad_y_ratio,
+                pad_y_ratio=self._pad_y_ratio,
+                pad_left_ratio=self._pad_left_ratio,
+                pad_right_ratio=self._pad_right_ratio,
             )
             if full_crop.size == 0:
                 continue
@@ -359,16 +367,28 @@ class OpenCvEasyOcrLprEngine(LprEngine):
         y: int,
         width: int,
         height: int,
-        pad_x_ratio: float,
-        pad_y_ratio: float,
+        pad_x_ratio: float | None = None,
+        pad_y_ratio: float = 0.12,
+        pad_left_ratio: float | None = None,
+        pad_right_ratio: float | None = None,
     ) -> np.ndarray:
         """Recorta la región con padding, recortando a los límites de la imagen."""
         frame_height, frame_width = image.shape[:2]
-        pad_x = int(round(width * pad_x_ratio))
+        symmetric_ratio = 0.20 if pad_x_ratio is None else pad_x_ratio
+        pad_left = int(
+            round(width * (
+                symmetric_ratio if pad_left_ratio is None else pad_left_ratio
+            ))
+        )
+        pad_right = int(
+            round(width * (
+                symmetric_ratio if pad_right_ratio is None else pad_right_ratio
+            ))
+        )
         pad_y = int(round(height * pad_y_ratio))
-        x0 = max(0, x - pad_x)
+        x0 = max(0, x - pad_left)
         y0 = max(0, y - pad_y)
-        x1 = min(frame_width, x + width + pad_x)
+        x1 = min(frame_width, x + width + pad_right)
         y1 = min(frame_height, y + height + pad_y)
         return image[y0:y1, x0:x1]
 
@@ -394,7 +414,14 @@ class OpenCvEasyOcrLprEngine(LprEngine):
             # bbox degenerada: sin recorte sensato (no se guarda el frame completo).
             return None
         return self._pad_crop(
-            image, x, y, width, height, self._pad_x_ratio, self._pad_y_ratio
+            image,
+            x,
+            y,
+            width,
+            height,
+            pad_y_ratio=self._pad_y_ratio,
+            pad_left_ratio=self._pad_left_ratio,
+            pad_right_ratio=self._pad_right_ratio,
         )
 
     def _build_variants(

@@ -29,7 +29,7 @@ def latest_local_event() -> dict:
     con un mensaje claro para que el consumidor (Ignition) sepa que el monitor
     aún no tiene datos.
     """
-      settings = get_settings()
+    settings = get_settings()
     path = Path(settings.biostar_local_output_path)
 
     if not path.exists():

@@ -366,6 +366,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--event-dir",
         default=os.getenv("IGNITION_LPR_EVENT_DIR", "C:/Users/Public/hgac_lpr_events"),
     )
+    parser.add_argument(
+        "--evidence-dir",
+        default=os.getenv(
+            "SIMPLELPR_EVIDENCE_DIR",
+            "./evidence/lpr/frames",
+        ),
+    )
+    parser.add_argument(
+        "--crop-dir",
+        default=os.getenv(
+            "SIMPLELPR_CROP_DIR",
+            "./evidence/lpr/crops",
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -416,10 +430,15 @@ def main(argv: list[str] | None = None) -> int:
 
     output_path = Path(args.output)
     event_dir = Path(args.event_dir)
+    evidence_dir = Path(args.evidence_dir)
+    crop_dir = Path(args.crop_dir)
     camera_ip = urlsplit(args.url).hostname or ""
     pending: dict[int, object] = {}
     pending_order: deque[int] = deque()
     completed_results: dict[int, object] = {}
+    recent_frames: dict[int, object] = {}
+    recent_frame_order: deque[int] = deque()
+    max_recent_frames = 300
     max_in_flight = max(1, args.max_in_flight)
     frame_stride = max(1, args.frame_stride)
     frame_count = 0
@@ -429,6 +448,52 @@ def main(argv: list[str] | None = None) -> int:
     result_count = 0
     last_published: dict[tuple[str, str], float] = {}
     heartbeat_at = time.monotonic()
+
+    def save_track_evidence(
+        track,
+        event_id: str,
+        identifier_type: str,
+        identifier: str,
+    ) -> tuple[str, str, str, str]:
+        """Guarda el frame representativo y el recorte exactos del track."""
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        crop_dir.mkdir(parents=True, exist_ok=True)
+
+        frame_path = ""
+        frame_url = ""
+        crop_path = ""
+        crop_url = ""
+        safe_id = "".join(
+            char if char.isalnum() or char in "-_" else "_"
+            for char in event_id
+        )
+        safe_type = "".join(
+            char if char.isalnum() or char in "-_" else "_"
+            for char in identifier_type.upper()
+        )
+        safe_identifier = "".join(
+            char if char.isalnum() or char in "-_" else "_"
+            for char in identifier.upper()
+        )
+        event_timestamp = safe_id.rsplit("-", 1)[-1]
+        evidence_name = f"{safe_type}_{safe_identifier}_{event_timestamp}"
+
+        representative_id = int(track.representativeFrameId)
+        representative_frame = recent_frames.get(representative_id)
+        if representative_frame is not None:
+            output_frame = evidence_dir / f"{evidence_name}.jpg"
+            representative_frame.saveAsJPEG(str(output_frame), 85)
+            frame_path = output_frame.as_posix()
+            frame_url = "/" + frame_path.lstrip("./")
+
+        thumbnail = getattr(track, "representativeThumbnail", None)
+        if thumbnail is not None:
+            output_crop = crop_dir / f"{evidence_name}_crop.jpg"
+            thumbnail.saveAsJPEG(str(output_crop), 90)
+            crop_path = output_crop.as_posix()
+            crop_url = "/" + crop_path.lstrip("./")
+
+        return frame_path, frame_url, crop_path, crop_url
 
     def publish_tracker_result(tracker_result) -> None:
         nonlocal duplicate_count
@@ -467,6 +532,23 @@ def main(argv: list[str] | None = None) -> int:
                 track_timestamp=float(track.firstDetectionTimestamp),
             )
             try:
+                frame_path, frame_url, crop_path, crop_url = save_track_evidence(
+                    track,
+                    payload["event_id"],
+                    identifier_type,
+                    identifier,
+                )
+                payload.update(
+                    {
+                        "frame_path": frame_path,
+                        "frame_url": frame_url,
+                        "crop_path": crop_path,
+                        "crop_url": crop_url,
+                    }
+                )
+            except Exception as exc:
+                print(f"[WARN] No se pudo guardar evidencia LPR: {exc}")
+            try:
                 _atomic_write(output_path, payload)
                 _atomic_write(_event_path(event_dir, payload), payload, retries=3)
             except OSError as exc:
@@ -496,6 +578,11 @@ def main(argv: list[str] | None = None) -> int:
             analyzed_frame = pending.pop(ordered_id, None)
             if analyzed_frame is None or ordered_result.errorInfo:
                 continue
+            recent_frames[ordered_id] = analyzed_frame
+            recent_frame_order.append(ordered_id)
+            while len(recent_frame_order) > max_recent_frames:
+                expired_id = recent_frame_order.popleft()
+                recent_frames.pop(expired_id, None)
             publish_tracker_result(
                 tracker.processFrameCandidates(ordered_result, analyzed_frame)
             )
