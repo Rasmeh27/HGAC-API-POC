@@ -576,12 +576,3 @@ ngrok http 8000
 ```
 
 ---
-
-## 19. Nota de consistencia del repositorio
-
-En el ZIP revisado existen endpoints Wialon y servicio Wialon, pero el archivo `scripts/poc_supervisor.py` aun no muestra un cuarto proceso Wialon continuo. Para evitar documentacion falsa, hay dos opciones antes de cerrar la rama:
-
-1. Implementar el worker Wialon en el supervisor y dejarlo con polling de 5 segundos.
-2. Mantener el README indicando que Wialon esta disponible por endpoint REST, pero no como proceso supervisado continuo.
-
-No se recomienda declarar que el supervisor mantiene cuatro procesos si el codigo subido todavia solo inicia tres.
