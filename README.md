@@ -1,6 +1,6 @@
 # Backend HGAC API
 
-Backend FastAPI para una prueba de concepto de monitoreo y validacion de cruces vehiculares en entorno portuario HGAC/HIT. El sistema integra lectura de placas y rotulos por camara RTSP, eventos BioStar, consultas RNTT/Navis, ubicacion GPS Wialon y consumo desde Ignition Perspective.
+Backend FastAPI para una prueba de concepto de monitoreo y validación de cruces vehiculares en entorno portuario HGAC/HIT. El sistema integra lectura de placas y rotulos por camara RTSP, eventos BioStar, consultas RNTT/Navis, ubicacion GPS Wialon y consumo desde Ignition Perspective.
 
 > Alcance: PoC operativo local. No debe tratarse como sistema productivo de control de acceso hasta completar persistencia, auditoria, hardening de seguridad, monitoreo de servicios y validaciones oficiales contra las fuentes maestras.
 
